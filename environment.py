@@ -2,7 +2,6 @@ from typing import Optional
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
 import torch
 from datetime import datetime
 import pytz
@@ -30,9 +29,13 @@ class LOBEnv(gym.Env):
         
         self.action_space = spaces.Discrete(3)
         if self.normalization:
-            self.observation_space = spaces.Box(low=-float('inf'), high=float('inf'), shape=(48,), dtype=float)
+            size = self.book_depth * 8
+            size += 24
+            self.observation_space = spaces.Box(low=-float('inf'), high=float('inf'), shape=(size,), dtype=float)
         else:
-            self.observation_space = spaces.Box(low=-float('inf'), high=float('inf'), shape=(36,), dtype=float)
+            size = self.book_depth * 4
+            size += 24
+            self.observation_space = spaces.Box(low=-float('inf'), high=float('inf'), shape=(size,), dtype=float)
 
     def reset(self, seed=None):
         super().reset(seed=seed)
