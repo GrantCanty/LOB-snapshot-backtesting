@@ -9,5 +9,4 @@ setup(
     author_email='gc933815@ohio.edu',
     licence='unlicense',
     packages=['environment'],
-    zip_safe=False
 )
