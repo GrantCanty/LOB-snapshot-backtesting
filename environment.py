@@ -12,10 +12,8 @@ def embed_positions(x, time_scale):
     cos_pos = np.cos(2 * np.pi * x / time_scale)
     return sin_pos, cos_pos
 
-fee_pct = 0.0005
-
 class LOBEnv(gym.Env):
-    def __init__(self, orderbook, device, book_depth, normalization=True):
+    def __init__(self, orderbook, device, book_depth, normalization=True, fee_pct=0.0005, steps_held_reward_cap=25):
         # large_cpu_tensor should be pinned for speed
         if device == 'cuda':
             self.data = orderbook.pin_memory() 
@@ -24,6 +22,8 @@ class LOBEnv(gym.Env):
         self.device = device
         self.book_depth = book_depth
         self.normalization = normalization
+        self.fee_pct = fee_pct
+        self.steps_held_reward_cap = steps_held_reward_cap
         self.current_step = 0
         self.max_steps = self.data.shape[0] - 1
         self.initial_cash = 100_000.0
@@ -85,7 +85,7 @@ class LOBEnv(gym.Env):
         self.time_since_open = current_ts.item() - self.market_open_time
 
     def _create_pos_encodings(self):
-        # 60 * 60 * 24 = total seconds in a day
+        # 60 * 60 * 24 = total seconds in a day. seconds * minutes * hours
         daily_pos_sin, daily_pos_cos = embed_positions(self.time_since_open.item(), 60*60*24)
         weekday_pos_sin, weekday_pos_cos = embed_positions(self.current_date.weekday(), 7)
         monthly_pos_sin, monthly_pos_cos = embed_positions(self.current_month, 12)
@@ -102,9 +102,9 @@ class LOBEnv(gym.Env):
         LOB_1m = self.data[index_1_min_ago]
         LOB_5m = self.data[index_5_min_ago]
 
-        midpoint_10s = (LOB_10s[7] + LOB_10s[1]) / 2
-        midpoint_1m = (LOB_1m[7] + LOB_1m[1]) / 2
-        midpoint_5m = (LOB_5m[7] + LOB_5m[1]) / 2
+        midpoint_10s = (LOB_10s[(self.book_depth*2)+1] + LOB_10s[1]) / 2
+        midpoint_1m = (LOB_1m[(self.book_depth*2)+1] + LOB_1m[1]) / 2
+        midpoint_5m = (LOB_5m[(self.book_depth*2)+1] + LOB_5m[1]) / 2
 
         midpoints = torch.stack([midpoint_10s, midpoint_1m, midpoint_5m])
         return midpoints
@@ -204,7 +204,6 @@ class LOBEnv(gym.Env):
         ])
 
         # combine all tensors together
-        #full_obs = torch.cat([LOB, engineered_features, private_state, positional_embeddings])
         if self.normalization:
             full_obs = torch.cat([LOB_norm, order_book_imbalance.view(1), spread.view(1), midpoint_changes, private_state, positional_embeddings])
         else:
@@ -241,14 +240,14 @@ class LOBEnv(gym.Env):
                 volume = ask_volumes[i].item()
 
                 # get the maximum number of whole shares that can be traded based on budget
-                max_shares = remaining_budget // (price * (1 + fee_pct))
+                max_shares = remaining_budget // (price * (1 + self.fee_pct))
 
                 # take the minimum volume between what is available and wehat we can trade
                 shares_taken = min(volume, max_shares)
 
                 # compute metrics
                 cost = shares_taken * price
-                fees = cost * fee_pct
+                fees = cost * self.fee_pct
                 exec_shares += shares_taken
                 exec_cost += (cost + fees)
                 exec_fees += fees
@@ -277,7 +276,7 @@ class LOBEnv(gym.Env):
 
                 # compute metrics
                 cost = shares_sold * price
-                fees = cost * fee_pct
+                fees = cost * self.fee_pct
                 exec_shares += shares_sold
                 exec_cost += (cost - fees)
                 exec_fees += fees
@@ -288,18 +287,24 @@ class LOBEnv(gym.Env):
             # handle edge case where not all shares are sold. give warning and execute remaining sale at the worst bid price
             if remaining_inventory > 0:
                 cost = remaining_inventory * bid_prices[-1].item()
-                fees = cost * fee_pct
+                fees = cost * self.fee_pct
                 exec_shares += remaining_inventory
                 exec_cost += (cost - fees)
                 exec_fees += fees
                 remaining_inventory -= remaining_inventory
-                
+                self.volume_mismatches += 1
+
             if exec_shares > 0:
                 self.total_return += exec_cost - (self.entry_price * self.inventory)
                 self.inventory = 0
                 self.entry_price = 0
                 self.cash += exec_cost
                 self.transaction_costs += exec_fees
+                self.steps_held = 0
+
+        else:
+            if self.inventory > 0:
+                self.steps_held += 1
                 
         # 2. Increment step
         self.current_step += 1
@@ -317,10 +322,14 @@ class LOBEnv(gym.Env):
         # replace these variables with the variables from the observation space
         midpoint = self._get_midpoint()
         new_total_balance = self.cash + (self.inventory * midpoint)
-        print(f'new_total_balance: cash: {self.cash} + (inventory: {self.inventory} * midpoint: {midpoint}) = {new_total_balance}')
-        reward = new_total_balance - self.total_balance
+        
+        return_reward = new_total_balance - self.total_balance
+        steps_held_reward = min((self.steps_held / 1000), self.steps_held_reward_cap/1000) # cap rewards for steps held after certain step count steps
+        reward = steps_held_reward + return_reward
+        
+        print(f'reward: {reward} | return_reward: {return_reward} steps_held_reward: {steps_held_reward}')
+        
         self.total_balance = new_total_balance
-        print(f'reward: {reward}')
         obs = self._get_obs()
         return obs, reward, terminated, truncated, {}
     
